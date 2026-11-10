@@ -1,0 +1,4 @@
+torch>=1.13
+numpy>=1.21
+# optional but recommended for exact edit distance
+python-Levenshtein>=0.20
