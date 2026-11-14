@@ -1,129 +1,132 @@
 """Training objective for the DNA hash network.
 
-The loss combines four terms (see paper / original ``hash_loss``):
+This is a faithful port of the original research ``hash_loss``
+(see ``train_36_groups_to_excel.py``).  The loss combines four parts:
 
-1. **positive** term -- pull same-cluster codes within ``pos_margin`` bits;
-2. **negative** term -- push different-cluster codes beyond ``neg_margin`` bits;
-3. **edit-distance** term -- for the (original, perturbed) read pairs, make the
-   Hamming distance follow a sigmoid ramp of the *true* edit distance, so the
-   codes stay ordered w.r.t. sequence similarity;
-4. regularisers -- quantisation (codes near 0/1), bit balance, decorrelation.
+1. **positive / negative pairwise term** (``L_pair``): same-cluster codes are
+   pulled within ``pos_margin``, different-cluster codes are pushed beyond
+   ``neg_margin``.  Distances here are **squared Euclidean** distances between
+   the *continuous* ``tanh`` outputs, which is what makes the objective
+   differentiable -- binarising the codes with ``sign`` would kill the gradient.
+2. **edit-distance term** (``L_edit``): for each (original, perturbed) read
+   pair produced by the perturbation mechanism, the squared-Euclidean distance
+   between the two hash vectors is required to stay below a sigmoid ramp of the
+   pair's *true* edit distance, so the codes remain ordered w.r.t. sequence
+   similarity.
+3. **quantisation / balance / decorrelation regularisers** on the continuous
+   output.
 
-Distance convention
--------------------
-All margins are expressed in **bits** (Hamming).  The network outputs a
-``tanh`` value in ``[-1, 1]``; for loss purposes we map it to a *soft* binary
-code ``b = (h + 1) / 2`` in ``[0, 1]`` and use the identity
+Scale convention
+----------------
+The two margins act on **different quantities**, which is the point stressed in
+the paper:
 
-    Hamming(b_i, b_j) = sum_k b_ik (1 - b_jk) + (1 - b_ik) b_jk
-                      = sum_k [b_ik + b_jk - 2 b_ik b_jk].
+* ``pos_margin = 2`` and ``neg_margin = 40`` are thresholds on the
+  **squared-Euclidean** distance between ``tanh`` hash vectors.  A ``tanh``
+  output lives in ``[-1, 1]^q``; the *original DNA reads* are of length
+  ``L`` (~110-170), so a squared-Euclidean separation of 40 between the hash
+  embeddings is readily reachable (it is not bounded by the 64-bit Hamming
+  range; that 64 bound only applies to the *Hamming* distance of the final
+  binary codes, which is a separate, downstream quantity).
+* the Hamming distance of the binarised codes is at most ``q`` bits and is only
+  used at clustering time, not in the training loss.
 
-This keeps margins interpretable (0 .. hash_dim).  The previous
-squared-Euclidean formulation saturated the ``tanh`` output and collapsed every
-read onto a single code; working in the binary/Hamming scale avoids that.
+This matches the behaviour of the reference ``hash_loss`` and keeps the
+gradient flowing through the continuous representation.
 """
 
 from __future__ import annotations
 
 import torch
 
-# Scale used by the edit-distance target ramp (same constants as research code).
+# Constants of the edit-distance target ramp (same as the research code):
+#   target(d) = 54 / (1 + exp(-(20 * (d - 20)) / 152)) + 10
 _EDIT_SEQ_LEN = 152.0
 _EDIT_SIG_CENTER = 20.0
 _EDIT_SIG_SLOPE = 20.0
-_EDIT_OFFSET = 10.0
 _EDIT_MAX = 54.0
+_EDIT_OFFSET = 10.0
 
 
-def _edit_target(edit_dis: torch.Tensor, hash_dim: int) -> torch.Tensor:
-    """Sigmoid ramp mapping true edit distance -> target Hamming distance (bits).
-
-    The raw ramp tops out around 64 for a 152-long read; it is rescaled into the
-    ``[0, hash_dim]`` range so it is meaningful for any hash size.
-    """
-    raw = _EDIT_MAX / (1.0 + torch.exp(-(_EDIT_SIG_SLOPE * (edit_dis - _EDIT_SIG_CENTER)) / _EDIT_SEQ_LEN)) + _EDIT_OFFSET
-    return raw / 64.0 * hash_dim
-
-
-def _soft_hamming(b: torch.Tensor) -> torch.Tensor:
-    """Pairwise soft Hamming distance (in bits) for codes in ``[0, 1]``."""
-    s = b.sum(dim=1, keepdim=True)
-    gram = b @ b.t()
-    return torch.relu(s + s.t() - 2.0 * gram)
+def _edit_target(edit_dis: torch.Tensor) -> torch.Tensor:
+    """Sigmoid ramp mapping true edit distance -> target squared-Euclidean distance."""
+    return _EDIT_MAX / (1.0 + torch.exp(-(_EDIT_SIG_SLOPE * (edit_dis - _EDIT_SIG_CENTER)) / _EDIT_SEQ_LEN)) + _EDIT_OFFSET
 
 
 def hash_loss(
     hash_codes: torch.Tensor,
     labels: torch.Tensor,
     edit_dis: torch.Tensor,
-    pos_margin: float = 0.15,
-    neg_margin: float = 0.40,
+    pos_margin: float = 2.0,
+    neg_margin: float = 40.0,
     alpha: float = 1e-3,
     beta: float = 1e-3,
     gamma: float = 1e-3,
 ) -> torch.Tensor:
-    """Compute the composite hash loss.
+    """Composite hash loss (port of the original research implementation).
 
     Parameters
     ----------
     hash_codes:
-        ``[2B, hash_dim]`` ``tanh`` outputs in ``[-1, 1]`` -- first ``B`` rows
-        are originals, next ``B`` their perturbations.
+        ``[2B, q]`` ``tanh`` outputs in ``[-1, 1]``.  The first ``B`` rows are
+        the original reads, the next ``B`` their perturbations.
     labels:
-        ``[2B]`` cluster labels (originals and perturbations share label).
+        ``[2B]`` cluster labels; an original and its perturbation share a label.
     edit_dis:
         ``[B]`` true edit distance between each (original, perturbation) pair.
     pos_margin, neg_margin:
-        Hamming thresholds as a *fraction of hash_dim* (default: positives within
-        15 % of bits, negatives at least 40 % of bits apart).
+        Squared-Euclidean thresholds for positive / negative pairs
+        (defaults 2 and 40, as in the reference code).
     """
-    num_bits = int(hash_codes.shape[1])
+    q = int(hash_codes.shape[1])
     batch_size = int(hash_codes.shape[0])
     ori_b = batch_size // 2
     device = hash_codes.device
 
-    b = (hash_codes + 1.0) * 0.5                       # tanh -> soft binary
-    dist = _soft_hamming(b)                            # bits, 0..num_bits
+    # Pairwise squared-Euclidean distances on the continuous codes.
+    squared_norms = torch.sum(hash_codes ** 2, dim=1, keepdim=True)
+    inner_products = torch.matmul(hash_codes, hash_codes.t())
+    dist_matrix = torch.relu(squared_norms + squared_norms.t() - 2 * inner_products)
 
     label_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+    identity_part = torch.eye(ori_b, dtype=torch.bool, device=device)
+
+    # Mask selecting the (original, perturbation) pairs.
+    edit_dist_mask = torch.zeros_like(dist_matrix, dtype=torch.bool)
+    edit_dist_mask[:ori_b, ori_b:] = identity_part
+    edit_dist_mask[ori_b:, :ori_b] = identity_part
     is_not_self = ~torch.eye(batch_size, dtype=torch.bool, device=device)
 
-    pos_thr = pos_margin * num_bits
-    neg_thr = neg_margin * num_bits
-
-    # -- positives ---------------------------------------------------------
+    # -- positive / negative pairwise term --------------------------------
     pos_mask = label_matrix & is_not_self
-    pos_vals = torch.relu(dist[pos_mask] - pos_thr)
-    pos_loss = pos_vals.mean() if pos_vals.numel() else torch.zeros((), device=device)
+    pos_vals = torch.relu(dist_matrix[pos_mask] - pos_margin)
+    pos_loss = pos_vals.mean() if pos_vals.numel() > 0 else torch.zeros((), device=device)
 
-    # -- negatives ---------------------------------------------------------
     neg_mask = ~label_matrix
-    neg_vals = torch.relu(neg_thr - dist[neg_mask])
-    neg_loss = neg_vals.mean() if neg_vals.numel() else torch.zeros((), device=device)
+    neg_vals = torch.relu(neg_margin - dist_matrix[neg_mask])
+    neg_loss = neg_vals.mean() if neg_vals.numel() > 0 else torch.zeros((), device=device)
 
     # -- edit-distance term ------------------------------------------------
+    target_edit_matrix = torch.zeros_like(dist_matrix)
     idx = torch.arange(ori_b, device=device)
-    edit_mask = torch.zeros_like(dist, dtype=torch.bool)
-    edit_mask[idx, idx + ori_b] = True
-    edit_mask[idx + ori_b, idx] = True
+    target_edit_matrix[idx, idx + ori_b] = edit_dis
+    target_edit_matrix[idx + ori_b, idx] = edit_dis
 
-    target = torch.zeros_like(dist)
-    target[idx, idx + ori_b] = edit_dis
-    target[idx + ori_b, idx] = edit_dis
-    target_ham = _edit_target(target, num_bits)
-    edit_vals = torch.relu(dist[edit_mask] - target_ham[edit_mask])
-    edit_loss = edit_vals.mean() if edit_vals.numel() else torch.zeros((), device=device)
+    target = _edit_target(target_edit_matrix)
+    edit_vals = torch.relu(dist_matrix[edit_dist_mask] - target[edit_dist_mask])
+    edit_loss = edit_vals.mean() if edit_vals.numel() > 0 else torch.zeros((), device=device)
 
-    # -- regularisers ------------------------------------------------------
-    quantization_loss = torch.mean((hash_codes.abs() - 1.0).pow(2))
-    bit_mean = torch.mean(b, dim=0)                    # want 0.5 -> balanced
-    balance_loss = torch.mean((bit_mean - 0.5).pow(2))
-    centered = b - bit_mean
-    cov = torch.matmul(centered.t(), centered) / batch_size
-    ident = torch.eye(num_bits, device=device)
-    decorrelation_loss = torch.mean(torch.abs(cov * (1 - ident)))
+    # -- regularisers (on continuous codes) --------------------------------
+    quantization_loss = torch.mean((hash_codes.pow(2) - 1.0).pow(2))
+    bit_mean = torch.mean(hash_codes, dim=0)
+    balance_loss = torch.mean(bit_mean.pow(2))
+    codes_centered = hash_codes - bit_mean
+    covariance_matrix = torch.matmul(codes_centered.t(), codes_centered) / batch_size
+    identity_matrix = torch.eye(q, device=device)
+    decorrelation_loss = torch.mean(torch.abs(covariance_matrix * (1 - identity_matrix)))
 
-    return (pos_loss + neg_loss + 1.0 * edit_loss
-            + alpha * quantization_loss
-            + beta * balance_loss
-            + gamma * decorrelation_loss)
+    total_loss = (pos_loss + neg_loss + 0.1 * edit_loss
+                  + alpha * quantization_loss
+                  + beta * balance_loss
+                  + gamma * decorrelation_loss)
+    return total_loss
